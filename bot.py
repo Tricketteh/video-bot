@@ -20,8 +20,18 @@ from telegram.ext import Application, ContextTypes, InlineQueryHandler, MessageH
 # Configuration
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+MAX_CONCURRENT_DOWNLOADS = 1
 MAX_BOT_FILE_BYTES = int(os.getenv("MAX_BOT_FILE_BYTES", str(50 * 1024 * 1024)))
+DOWNLOAD_RETRY_ATTEMPTS = int(os.getenv("DOWNLOAD_RETRY_ATTEMPTS", "3"))
+RETRY_PAUSE_SECONDS = float(os.getenv("RETRY_PAUSE_SECONDS", "3"))
+REQUEST_PAUSE_SECONDS = float(os.getenv("REQUEST_PAUSE_SECONDS", "1"))
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+COOKIES_DIR = Path("cookies")
+TIKTOK_COOKIES = COOKIES_DIR / "tiktok.txt"
+INSTAGRAM_COOKIES = COOKIES_DIR / "ig.txt"
 
 # -------------------------
 # Logging
@@ -61,9 +71,23 @@ async def download_video(url: str, temp_dir: Path) -> Path:
         "noplaylist": True,
         "merge_output_format": "mp4",
         "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
+        "sleep_interval_requests": REQUEST_PAUSE_SECONDS,
+        "user_agent": CHROME_USER_AGENT,
         "quiet": True,
         "no_warnings": True,
     }
+
+    lowered = url.lower()
+    if "tiktok.com" in lowered and TIKTOK_COOKIES.exists():
+        ydl_opts["cookiefile"] = str(TIKTOK_COOKIES)
+    elif "tiktok.com" in lowered:
+        logger.warning("TikTok cookies file is missing: %s", TIKTOK_COOKIES)
+    elif "instagram.com" in lowered and INSTAGRAM_COOKIES.exists():
+        ydl_opts["cookiefile"] = str(INSTAGRAM_COOKIES)
+    elif "instagram.com" in lowered:
+        logger.warning("Instagram cookies file is missing: %s", INSTAGRAM_COOKIES)
 
     def _run() -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -72,8 +96,25 @@ async def download_video(url: str, temp_dir: Path) -> Path:
                 info = info["entries"][0]
             return ydl.prepare_filename(info)
 
-    filename = await asyncio.to_thread(_run)
-    return Path(filename)
+    last_error = None
+    for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+        try:
+            filename = await asyncio.to_thread(_run)
+            return Path(filename)
+        except Exception as err:
+            last_error = err
+            if attempt >= DOWNLOAD_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "Download attempt failed (attempt=%s/%s, url=%s): %s",
+                attempt,
+                DOWNLOAD_RETRY_ATTEMPTS,
+                url,
+                err,
+            )
+            await asyncio.sleep(RETRY_PAUSE_SECONDS)
+
+    raise RuntimeError(f"Failed to download after retries: {url}") from last_error
 
 
 # -------------------------
