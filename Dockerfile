@@ -8,7 +8,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Install python dependencies
-RUN pip install --no-cache-dir python-telegram-bot>=20.0 yt-dlp
+RUN pip install --no-cache-dir "python-telegram-bot[job-queue]>=20.0" yt-dlp
 
 # Copy bot
 COPY bot.py /app/bot.py
