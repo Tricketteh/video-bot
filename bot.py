@@ -138,9 +138,7 @@ async def expand_url(url: str) -> str:
         return url
 
 
-async def find_download_target(text: str) -> tuple[str | None, str | None, str | None]:
-    saw_non_shorts_youtube = False
-
+async def find_download_target(text: str) -> tuple[str | None, str | None]:
     for raw_url in extract_links(text):
         final_url = await expand_url(raw_url)
         platform = detect_platform(final_url) or detect_platform(raw_url)
@@ -149,16 +147,13 @@ async def find_download_target(text: str) -> tuple[str | None, str | None, str |
 
         if not is_supported_download_url(final_url, platform):
             if platform == "youtube":
-                saw_non_shorts_youtube = True
                 logger.info("Skipping non-Shorts YouTube URL: original=%s final=%s", raw_url, final_url)
             continue
 
         logger.info("Using URL: original=%s final=%s platform=%s", raw_url, final_url, platform)
-        return final_url, platform, None
+        return final_url, platform
 
-    if saw_non_shorts_youtube:
-        return None, None, "For YouTube, only Shorts links are supported."
-    return None, None, None
+    return None, None
 
 
 # -------------------------
@@ -289,11 +284,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not chat:
         return
 
-    url, platform, rejection_text = await find_download_target(message.text)
-    if rejection_text:
-        await chat.send_message(rejection_text)
-        return
-
+    url, platform = await find_download_target(message.text)
     if not url or not platform:
         return
     sender_name = resolve_sender_name(update.effective_user)
@@ -368,11 +359,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query:
         return
 
-    url, platform, rejection_text = await find_download_target(query)
-    if rejection_text:
-        await inline_query.answer(results=[], cache_time=1, is_personal=True)
-        return
-
+    url, platform = await find_download_target(query)
     if not url or not platform:
         return
 
