@@ -5,15 +5,20 @@ Usage (local):
 """
 
 import asyncio
+import contextlib
+import html
 import logging
 import os
 import re
 import tempfile
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
 from telegram import InlineQueryResultCachedVideo, Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, InlineQueryHandler, MessageHandler, filters
 
 # -------------------------
@@ -25,6 +30,7 @@ MAX_BOT_FILE_BYTES = int(os.getenv("MAX_BOT_FILE_BYTES", str(50 * 1024 * 1024)))
 DOWNLOAD_RETRY_ATTEMPTS = int(os.getenv("DOWNLOAD_RETRY_ATTEMPTS", "3"))
 RETRY_PAUSE_SECONDS = float(os.getenv("RETRY_PAUSE_SECONDS", "3"))
 REQUEST_PAUSE_SECONDS = float(os.getenv("REQUEST_PAUSE_SECONDS", "1"))
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "300"))
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -32,6 +38,8 @@ CHROME_USER_AGENT = (
 COOKIES_DIR = Path("cookies")
 TIKTOK_COOKIES = COOKIES_DIR / "tiktok.txt"
 INSTAGRAM_COOKIES = COOKIES_DIR / "ig.txt"
+YOUTUBE_COOKIES = COOKIES_DIR / "youtube.txt"
+URL_EXPAND_TIMEOUT_SECONDS = float(os.getenv("URL_EXPAND_TIMEOUT_SECONDS", "12"))
 
 # -------------------------
 # Logging
@@ -41,29 +49,122 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("video-bot")
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # -------------------------
 # URL Detection
 # -------------------------
 URL_REGEX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-SUPPORTED_PATTERNS = [
-    re.compile(r"https?://(www\.)?tiktok\.com/.*", re.IGNORECASE),
-    re.compile(r"https?://(www\.)?instagram\.com/reels?/.*", re.IGNORECASE),
-    re.compile(r"https?://(www\.)?youtube\.com/shorts/.*", re.IGNORECASE),
-    re.compile(r"https?://(www\.)?youtu\.be/.*", re.IGNORECASE),
-]
+
+def extract_links(text: str) -> list[str]:
+    raw_links = URL_REGEX.findall(text or "")
+    return [link.rstrip(".,;:!?)]}>") for link in raw_links]
 
 
-def extract_supported_links(text: str) -> list[str]:
-    links = URL_REGEX.findall(text or "")
-    return [link for link in links if any(p.match(link) for p in SUPPORTED_PATTERNS)]
+def detect_platform(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().split(":")[0]
+    path = parsed.path.lower()
+
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"} and (
+        path.startswith("/watch") or path.startswith("/shorts/")
+    ):
+        return "youtube"
+    if host == "youtu.be":
+        return "youtube"
+
+    if host in {"instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am"} and (
+        path.startswith("/reel/") or path.startswith("/p/")
+    ):
+        return "instagram"
+
+    if host in {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}:
+        return "tiktok"
+
+    return None
+
+
+def is_supported_download_url(url: str, platform: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if platform == "youtube":
+        return path.startswith("/shorts/")
+    if platform == "instagram":
+        return path.startswith("/reel/") or path.startswith("/p/")
+    return platform == "tiktok"
+
+
+def get_cookiefile_for_platform(platform: str) -> Path | None:
+    if platform == "tiktok":
+        return TIKTOK_COOKIES
+    if platform == "instagram":
+        return INSTAGRAM_COOKIES
+    if platform == "youtube":
+        return YOUTUBE_COOKIES
+    return None
+
+
+def _expand_url_sync(url: str) -> str:
+    request_headers = {
+        "User-Agent": CHROME_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+    }
+
+    request = Request(url, headers=request_headers, method="HEAD")
+    try:
+        with contextlib.closing(urlopen(request, timeout=URL_EXPAND_TIMEOUT_SECONDS)) as response:
+            return response.geturl()
+    except Exception as head_err:
+        logger.info("HEAD expand failed for %s: %s", url, head_err)
+
+    request = Request(url, headers=request_headers, method="GET")
+    with contextlib.closing(urlopen(request, timeout=URL_EXPAND_TIMEOUT_SECONDS)) as response:
+        return response.geturl()
+
+
+async def expand_url(url: str) -> str:
+    try:
+        final_url = await asyncio.to_thread(_expand_url_sync, url)
+        if final_url != url:
+            logger.info("Expanded URL: original=%s final=%s", url, final_url)
+        else:
+            logger.info("Resolved URL without redirects: %s", final_url)
+        return final_url
+    except Exception as expand_err:
+        logger.warning("Could not expand URL %s: %s", url, expand_err)
+        return url
+
+
+async def find_download_target(text: str) -> tuple[str | None, str | None, str | None]:
+    saw_non_shorts_youtube = False
+
+    for raw_url in extract_links(text):
+        final_url = await expand_url(raw_url)
+        platform = detect_platform(final_url) or detect_platform(raw_url)
+        if not platform:
+            continue
+
+        if not is_supported_download_url(final_url, platform):
+            if platform == "youtube":
+                saw_non_shorts_youtube = True
+                logger.info("Skipping non-Shorts YouTube URL: original=%s final=%s", raw_url, final_url)
+            continue
+
+        logger.info("Using URL: original=%s final=%s platform=%s", raw_url, final_url, platform)
+        return final_url, platform, None
+
+    if saw_non_shorts_youtube:
+        return None, None, "For YouTube, only Shorts links are supported."
+    return None, None, None
 
 
 # -------------------------
 # Downloader
 # -------------------------
-async def download_video(url: str, temp_dir: Path) -> Path:
+async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
     """Run yt-dlp in a thread and return downloaded file path."""
     ydl_opts = {
         "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
@@ -75,19 +176,19 @@ async def download_video(url: str, temp_dir: Path) -> Path:
         "fragment_retries": 2,
         "sleep_interval_requests": REQUEST_PAUSE_SECONDS,
         "user_agent": CHROME_USER_AGENT,
+        "http_headers": {
+            "User-Agent": CHROME_USER_AGENT,
+            "Referer": "https://www.youtube.com/",
+        },
         "quiet": True,
         "no_warnings": True,
     }
 
-    lowered = url.lower()
-    if "tiktok.com" in lowered and TIKTOK_COOKIES.exists():
-        ydl_opts["cookiefile"] = str(TIKTOK_COOKIES)
-    elif "tiktok.com" in lowered:
-        logger.warning("TikTok cookies file is missing: %s", TIKTOK_COOKIES)
-    elif "instagram.com" in lowered and INSTAGRAM_COOKIES.exists():
-        ydl_opts["cookiefile"] = str(INSTAGRAM_COOKIES)
-    elif "instagram.com" in lowered:
-        logger.warning("Instagram cookies file is missing: %s", INSTAGRAM_COOKIES)
+    default_cookiefile = get_cookiefile_for_platform(platform)
+    if default_cookiefile and default_cookiefile.exists():
+        ydl_opts["cookiefile"] = str(default_cookiefile)
+    elif default_cookiefile:
+        logger.warning("Cookies file is missing for %s: %s", platform, default_cookiefile)
 
     def _run() -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -103,12 +204,44 @@ async def download_video(url: str, temp_dir: Path) -> Path:
             return Path(filename)
         except Exception as err:
             last_error = err
+            error_text = str(err).lower()
+
+            if "redirect" in error_text:
+                logger.warning("Redirect-related yt-dlp error. final_url=%s error=%s", url, err)
+
+            login_required = any(
+                phrase in error_text
+                for phrase in (
+                    "login required",
+                    "sign in",
+                    "age-restricted",
+                    "age restricted",
+                    "confirm you're not a bot",
+                    "confirm you are not a bot",
+                )
+            )
+            if login_required and default_cookiefile and "cookiefile" not in ydl_opts:
+                if default_cookiefile.exists():
+                    ydl_opts["cookiefile"] = str(default_cookiefile)
+                    logger.warning(
+                        "Retrying with cookies after login-required error: platform=%s cookies=%s",
+                        platform,
+                        default_cookiefile,
+                    )
+                    continue
+                logger.warning(
+                    "Login-required error but cookies are missing: platform=%s expected=%s",
+                    platform,
+                    default_cookiefile,
+                )
+
             if attempt >= DOWNLOAD_RETRY_ATTEMPTS:
                 break
             logger.warning(
-                "Download attempt failed (attempt=%s/%s, url=%s): %s",
+                "Download attempt failed (attempt=%s/%s, platform=%s, url=%s): %s",
                 attempt,
                 DOWNLOAD_RETRY_ATTEMPTS,
+                platform,
                 url,
                 err,
             )
@@ -133,6 +266,20 @@ async def safe_edit_status(status_msg, text: str) -> None:
         logger.info("Could not edit status message: %s", edit_err)
 
 
+def resolve_sender_name(user) -> str:
+    if not user:
+        return "unknown"
+    if user.username:
+        return f"@{user.username}"
+    return user.full_name or "unknown"
+
+
+def build_video_caption(source_url: str, sender_name: str) -> str:
+    safe_url = html.escape(source_url, quote=True)
+    safe_sender_name = html.escape(sender_name)
+    return f'<a href="{safe_url}">Video</a> sent by <b>{safe_sender_name}</b>'
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not message.text:
@@ -142,11 +289,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not chat:
         return
 
-    links = extract_supported_links(message.text)
-    if not links:
+    url, platform, rejection_text = await find_download_target(message.text)
+    if rejection_text:
+        await chat.send_message(rejection_text)
         return
 
-    url = links[0]
+    if not url or not platform:
+        return
+    sender_name = resolve_sender_name(update.effective_user)
+    video_caption = build_video_caption(url, sender_name)
 
     # Scenario 1:
     # 1) delete original message with link
@@ -164,7 +315,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         temp_dir = Path(temp_dir_obj.name)
 
         try:
-            file_path = await download_video(url, temp_dir)
+            file_path = await download_video(url, platform, temp_dir)
             if not file_path.exists():
                 raise FileNotFoundError("Downloaded file not found.")
 
@@ -181,7 +332,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await chat.send_video(
                         video=f,
                         supports_streaming=True,
-                        caption="Here you go!",
+                        caption=video_caption,
+                        parse_mode=ParseMode.HTML,
                     )
                 try:
                     await status_msg.delete()
@@ -216,12 +368,17 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query:
         return
 
-    links = extract_supported_links(query)
-    if not links:
+    url, platform, rejection_text = await find_download_target(query)
+    if rejection_text:
+        await inline_query.answer(results=[], cache_time=1, is_personal=True)
+        return
+
+    if not url or not platform:
         return
 
     user_id = inline_query.from_user.id
-    url = links[0]
+    sender_name = resolve_sender_name(inline_query.from_user)
+    video_caption = build_video_caption(url, sender_name)
 
     # Scenario 2:
     # 1) user enters @bot + url
@@ -243,7 +400,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         temp_dir = Path(temp_dir_obj.name)
         try:
             logger.info("Inline download started: user_id=%s url=%s", user_id, url)
-            file_path = await download_video(url, temp_dir)
+            file_path = await download_video(url, platform, temp_dir)
             if not file_path.exists():
                 raise FileNotFoundError("Downloaded file not found.")
 
@@ -267,7 +424,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id=user_id,
                     video=f,
                     supports_streaming=True,
-                    caption="Here you go!",
+                    caption=video_caption,
+                    parse_mode=ParseMode.HTML,
                 )
             file_id = sent.video.file_id if sent and sent.video else None
             if not file_id:
@@ -300,6 +458,10 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.error("Failed to clean temp dir: %s", temp_dir)
 
 
+async def log_heartbeat(_: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Bot is listening...")
+
+
 # -------------------------
 # Main
 # -------------------------
@@ -320,7 +482,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
 
-    logger.info("Bot started. Polling...")
+    app.job_queue.run_repeating(log_heartbeat, interval=HEARTBEAT_INTERVAL_SECONDS, first=0)
+    logger.info("Bot started. Polling and waiting for updates...")
     app.run_polling(close_loop=False)
 
 
