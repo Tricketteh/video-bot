@@ -84,16 +84,24 @@ def detect_platform(url: str) -> str | None:
     if host in {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}:
         return "tiktok"
 
+    if host in {"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}:
+        return "twitch"
+
     return None
 
 
 def is_supported_download_url(url: str, platform: str) -> bool:
     parsed = urlparse(url)
+    host = parsed.netloc.lower().split(":")[0]
     path = parsed.path.lower()
     if platform == "youtube":
         return path.startswith("/shorts/")
     if platform == "instagram":
         return path.startswith("/reel/") or path.startswith("/p/")
+    if platform == "twitch":
+        if host == "clips.twitch.tv":
+            return True
+        return "/clip/" in path
     return platform == "tiktok"
 
 
@@ -148,6 +156,8 @@ async def find_download_target(text: str) -> tuple[str | None, str | None]:
         if not is_supported_download_url(final_url, platform):
             if platform == "youtube":
                 logger.info("Skipping non-Shorts YouTube URL: original=%s final=%s", raw_url, final_url)
+            if platform == "twitch":
+                logger.info("Skipping non-clip Twitch URL: original=%s final=%s", raw_url, final_url)
             continue
 
         logger.info("Using URL: original=%s final=%s platform=%s", raw_url, final_url, platform)
