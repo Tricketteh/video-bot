@@ -40,6 +40,7 @@ COOKIES_DIR = Path("cookies")
 TIKTOK_COOKIES = COOKIES_DIR / "tiktok.txt"
 INSTAGRAM_COOKIES = COOKIES_DIR / "ig.txt"
 YOUTUBE_COOKIES = COOKIES_DIR / "youtube.txt"
+REDGIFS_COOKIES = COOKIES_DIR / "redgifs.txt"
 URL_EXPAND_TIMEOUT_SECONDS = float(os.getenv("URL_EXPAND_TIMEOUT_SECONDS", "12"))
 SEEN_URL_TTL_SECONDS = int(os.getenv("SEEN_URL_TTL_SECONDS", "300"))
 GLOBAL_DOWNLOAD_COOLDOWN_SECONDS = float(os.getenv("GLOBAL_DOWNLOAD_COOLDOWN_SECONDS", "5"))
@@ -90,6 +91,9 @@ def detect_platform(url: str) -> str | None:
     if host in {"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}:
         return "twitch"
 
+    if host in {"redgifs.com", "www.redgifs.com"}:
+        return "redgifs"
+
     return None
 
 
@@ -105,6 +109,8 @@ def is_supported_download_url(url: str, platform: str) -> bool:
         if host == "clips.twitch.tv":
             return True
         return "/clip/" in path
+    if platform == "redgifs":
+        return path.startswith("/watch/") or path.startswith("/ifr/")
     return platform == "tiktok"
 
 
@@ -115,6 +121,8 @@ def get_cookiefile_for_platform(platform: str) -> Path | None:
         return INSTAGRAM_COOKIES
     if platform == "youtube":
         return YOUTUBE_COOKIES
+    if platform == "redgifs":
+        return REDGIFS_COOKIES
     return None
 
 
@@ -190,10 +198,19 @@ async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
         },
         "quiet": True,
         "no_warnings": True,
+        "max_filesize": MAX_BOT_FILE_BYTES,
     }
 
+    if platform == "redgifs":
+        ydl_opts["format"] = "best[ext=mp4]/best"
+        ydl_opts["sleep_interval_requests"] = 10
+        ydl_opts["http_headers"] = {
+            "User-Agent": CHROME_USER_AGENT,
+            "Referer": "https://www.redgifs.com/",
+        }
+
     default_cookiefile = get_cookiefile_for_platform(platform)
-    if default_cookiefile and default_cookiefile.exists():
+    if default_cookiefile and default_cookiefile.exists() and platform != "redgifs":
         ydl_opts["cookiefile"] = str(default_cookiefile)
     elif default_cookiefile:
         logger.warning("Cookies file is missing for %s: %s", platform, default_cookiefile)
@@ -213,9 +230,30 @@ async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
         except Exception as err:
             last_error = err
             error_text = str(err).lower()
+            logger.exception(
+                "yt-dlp attempt failed: attempt=%s/%s platform=%s url=%s cookiefile=%s",
+                attempt,
+                DOWNLOAD_RETRY_ATTEMPTS,
+                platform,
+                url,
+                ydl_opts.get("cookiefile", "none"),
+            )
 
             if "redirect" in error_text:
                 logger.warning("Redirect-related yt-dlp error. final_url=%s error=%s", url, err)
+
+            if platform == "redgifs" and default_cookiefile and "cookiefile" not in ydl_opts:
+                if default_cookiefile.exists():
+                    ydl_opts["cookiefile"] = str(default_cookiefile)
+                    logger.warning(
+                        "Retrying redgifs download with cookies: cookies=%s",
+                        default_cookiefile,
+                    )
+                    continue
+                logger.warning(
+                    "Redgifs retry with cookies skipped, file is missing: %s",
+                    default_cookiefile,
+                )
 
             login_required = any(
                 phrase in error_text
@@ -374,6 +412,8 @@ def get_download_failure_reason(err: Exception, platform: str) -> str:
 
     if "downloaded file not found" in error_text:
         return "download failed: file not found after yt-dlp run"
+    if "max-filesize" in error_text or "larger than max" in error_text:
+        return "video is too large for Telegram"
     if "too large for telegram" in error_text:
         return "video is too large for Telegram"
 
