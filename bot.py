@@ -461,7 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         logger.info("Download finished: chat_id=%s url=%s size_bytes=%s", chat.id, url, file_size)
 
                         if file_size <= MAX_BOT_FILE_BYTES:
-                            # 3) success: send video and mark status as uploaded
+                            # 3) success: send video and remove status message
                             logger.info("Sending video: chat_id=%s url=%s", chat.id, url)
                             with file_path.open("rb") as f:
                                 await chat.send_video(
@@ -470,7 +470,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                     caption=video_caption,
                                     parse_mode=ParseMode.HTML,
                                 )
-                            await safe_edit_status(status_msg, "Uploaded")
+                            try:
+                                await status_msg.delete()
+                                status_msg = None
+                            except Exception as delete_err:
+                                logger.info("Could not delete status message: %s", delete_err)
                         else:
                             # 4) explicit failure with short status and chat error details
                             reason = "video is too large for Telegram"
