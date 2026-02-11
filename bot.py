@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,6 +41,8 @@ TIKTOK_COOKIES = COOKIES_DIR / "tiktok.txt"
 INSTAGRAM_COOKIES = COOKIES_DIR / "ig.txt"
 YOUTUBE_COOKIES = COOKIES_DIR / "youtube.txt"
 URL_EXPAND_TIMEOUT_SECONDS = float(os.getenv("URL_EXPAND_TIMEOUT_SECONDS", "12"))
+SEEN_URL_TTL_SECONDS = int(os.getenv("SEEN_URL_TTL_SECONDS", "300"))
+GLOBAL_DOWNLOAD_COOLDOWN_SECONDS = float(os.getenv("GLOBAL_DOWNLOAD_COOLDOWN_SECONDS", "5"))
 
 # -------------------------
 # Logging
@@ -260,6 +263,54 @@ async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
 # -------------------------
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 inline_cache: dict[str, str] = {}
+seen_urls: dict[str, float] = {}
+processing_urls: set[str] = set()
+url_dedupe_lock = asyncio.Lock()
+download_queue_lock = asyncio.Lock()
+next_download_allowed_at = 0.0
+
+
+def _prune_seen_urls(now: float) -> None:
+    expired_urls = [u for u, expires_at in seen_urls.items() if expires_at <= now]
+    for url in expired_urls:
+        seen_urls.pop(url, None)
+
+
+async def try_acquire_url(url: str) -> bool:
+    now = time.monotonic()
+    async with url_dedupe_lock:
+        _prune_seen_urls(now)
+        if url in processing_urls:
+            return False
+        expires_at = seen_urls.get(url)
+        if expires_at and expires_at > now:
+            return False
+        processing_urls.add(url)
+        return True
+
+
+async def release_url(url: str, mark_seen: bool = True) -> None:
+    now = time.monotonic()
+    async with url_dedupe_lock:
+        processing_urls.discard(url)
+        if mark_seen:
+            seen_urls[url] = now + SEEN_URL_TTL_SECONDS
+        _prune_seen_urls(now)
+
+
+@contextlib.asynccontextmanager
+async def global_download_slot():
+    global next_download_allowed_at
+    async with download_queue_lock:
+        now = time.monotonic()
+        wait_seconds = max(0.0, next_download_allowed_at - now)
+        if wait_seconds > 0:
+            logger.info("Waiting for global download cooldown: %.2fs", wait_seconds)
+            await asyncio.sleep(wait_seconds)
+        try:
+            yield
+        finally:
+            next_download_allowed_at = time.monotonic() + GLOBAL_DOWNLOAD_COOLDOWN_SECONDS
 
 
 async def safe_edit_status(status_msg, text: str) -> None:
@@ -279,10 +330,83 @@ def resolve_sender_name(user) -> str:
     return user.full_name or "unknown"
 
 
-def build_video_caption(source_url: str, sender_name: str) -> str:
+def build_video_caption(source_url: str, sender_name: str, multiple_links: bool = False) -> str:
     safe_url = html.escape(source_url, quote=True)
     safe_sender_name = html.escape(sender_name)
-    return f'<a href="{safe_url}">Video</a> sent by <b>{safe_sender_name}</b>'
+    caption = f'<a href="{safe_url}">Video</a> sent by <b>{safe_sender_name}</b>'
+    if multiple_links:
+        caption += "\n\nOnly one link per message is supported."
+    return caption
+
+
+def _normalize_error_reason(raw_reason: str) -> str:
+    reason = (raw_reason or "").strip()
+    if not reason:
+        return "unknown error"
+    reason = reason.replace("\n", " ").replace("\r", " ")
+    reason = re.sub(r"\s+", " ", reason).strip()
+    return reason[:180]
+
+
+def get_download_failure_reason(err: Exception, platform: str) -> str:
+    error_chain = [str(err or "")]
+    if getattr(err, "__cause__", None):
+        error_chain.append(str(err.__cause__))
+    full_error_text = " | ".join(error_chain)
+    error_text = full_error_text.lower()
+
+    login_required = any(
+        phrase in error_text
+        for phrase in (
+            "login required",
+            "sign in",
+            "age-restricted",
+            "age restricted",
+            "confirm you're not a bot",
+            "confirm you are not a bot",
+        )
+    )
+    if login_required:
+        cookiefile = get_cookiefile_for_platform(platform)
+        if cookiefile and not cookiefile.exists():
+            return f"login required: cookies file is missing ({cookiefile})"
+        return "login required: cookies are missing or expired"
+
+    if "downloaded file not found" in error_text:
+        return "download failed: file not found after yt-dlp run"
+    if "too large for telegram" in error_text:
+        return "video is too large for Telegram"
+
+    return _normalize_error_reason(error_chain[-1] or error_chain[0])
+
+
+def build_download_error_message(source_url: str, reason: str) -> str:
+    safe_url = html.escape(source_url, quote=True)
+    safe_reason = html.escape(_normalize_error_reason(reason))
+    return f'Couldn\'t download <a href="{safe_url}">video</a>: <i>{safe_reason}</i>'
+
+
+async def find_download_target_from_first_link(text: str) -> tuple[str | None, str | None, bool]:
+    links = extract_links(text)
+    if not links:
+        return None, None, False
+
+    raw_url = links[0]
+    has_multiple_links = len(links) > 1
+    final_url = await expand_url(raw_url)
+    platform = detect_platform(final_url) or detect_platform(raw_url)
+    if not platform:
+        return None, None, has_multiple_links
+
+    if not is_supported_download_url(final_url, platform):
+        if platform == "youtube":
+            logger.info("Skipping non-Shorts YouTube URL: original=%s final=%s", raw_url, final_url)
+        if platform == "twitch":
+            logger.info("Skipping non-clip Twitch URL: original=%s final=%s", raw_url, final_url)
+        return None, None, has_multiple_links
+
+    logger.info("Using first URL from message: original=%s final=%s platform=%s", raw_url, final_url, platform)
+    return final_url, platform, has_multiple_links
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -294,70 +418,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not chat:
         return
 
-    url, platform = await find_download_target(message.text)
+    url, platform, has_multiple_links = await find_download_target_from_first_link(message.text)
     if not url or not platform:
         return
-    sender_name = resolve_sender_name(update.effective_user)
-    video_caption = build_video_caption(url, sender_name)
 
-    # Scenario 1:
-    # 1) delete original message with link
-    try:
-        await message.delete()
-    except Exception as delete_err:
-        logger.info("Could not delete message: %s", delete_err)
-
-    # 2) send status immediately
-    status_msg = await chat.send_message("Downloading video...")
-    logger.info("Download started: chat_id=%s url=%s", chat.id, url)
-
-    async with download_semaphore:
-        temp_dir_obj = tempfile.TemporaryDirectory(prefix="video-bot-")
-        temp_dir = Path(temp_dir_obj.name)
-
+    acquired = await try_acquire_url(url)
+    if not acquired:
         try:
-            file_path = await download_video(url, platform, temp_dir)
-            if not file_path.exists():
-                raise FileNotFoundError("Downloaded file not found.")
+            await message.delete()
+        except Exception as delete_err:
+            logger.info("Could not delete duplicate message: %s", delete_err)
+        logger.info("Skipping duplicate URL: chat_id=%s url=%s", chat.id, url)
+        return
 
-            file_size = file_path.stat().st_size
-            logger.info("Download finished: chat_id=%s url=%s size_bytes=%s", chat.id, url, file_size)
+    sender_name = resolve_sender_name(update.effective_user)
+    video_caption = build_video_caption(url, sender_name, multiple_links=has_multiple_links)
+    status_msg = None
 
-            # 3) after download edit status
-            await safe_edit_status(status_msg, "Video downloaded. Sending...")
-
-            if file_size <= MAX_BOT_FILE_BYTES:
-                # 4) success: send video then remove status
-                logger.info("Sending video: chat_id=%s url=%s", chat.id, url)
-                with file_path.open("rb") as f:
-                    await chat.send_video(
-                        video=f,
-                        supports_streaming=True,
-                        caption=video_caption,
-                        parse_mode=ParseMode.HTML,
-                    )
+    try:
+        async with download_semaphore:
+            async with global_download_slot():
+                # Scenario 1:
+                # 1) delete original message with link
                 try:
-                    await status_msg.delete()
-                    status_msg = None
+                    await message.delete()
                 except Exception as delete_err:
-                    logger.info("Could not delete status message: %s", delete_err)
-            else:
-                # 5) error/limit case: keep status and edit
-                await safe_edit_status(
-                    status_msg,
-                    "Video is too large for Telegram. Download it from the original link.",
-                )
+                    logger.info("Could not delete message: %s", delete_err)
 
-        except Exception as e:
-            logger.error("Error handling URL %s: %s", url, e)
-            logger.error(traceback.format_exc())
-            # 5) error: edit status
-            await safe_edit_status(status_msg, "Download error. Try again later.")
-        finally:
-            try:
-                temp_dir_obj.cleanup()
-            except Exception:
-                logger.error("Failed to clean temp dir: %s", temp_dir)
+                # 2) send short status immediately after queue wait
+                status_msg = await chat.send_message("Processing...")
+                logger.info("Download started: chat_id=%s url=%s", chat.id, url)
+
+                with tempfile.TemporaryDirectory(prefix="video-bot-") as temp_dir_name:
+                    temp_dir = Path(temp_dir_name)
+
+                    try:
+                        file_path = await download_video(url, platform, temp_dir)
+                        if not file_path.exists():
+                            raise FileNotFoundError("Downloaded file not found.")
+
+                        file_size = file_path.stat().st_size
+                        logger.info("Download finished: chat_id=%s url=%s size_bytes=%s", chat.id, url, file_size)
+
+                        if file_size <= MAX_BOT_FILE_BYTES:
+                            # 3) success: send video and mark status as uploaded
+                            logger.info("Sending video: chat_id=%s url=%s", chat.id, url)
+                            with file_path.open("rb") as f:
+                                await chat.send_video(
+                                    video=f,
+                                    supports_streaming=True,
+                                    caption=video_caption,
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            await safe_edit_status(status_msg, "Uploaded")
+                        else:
+                            # 4) explicit failure with short status and chat error details
+                            reason = "video is too large for Telegram"
+                            await safe_edit_status(status_msg, f"Failed: {reason}")
+                            await chat.send_message(
+                                build_download_error_message(url, reason),
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True,
+                            )
+                    except Exception as e:
+                        logger.error("Error handling URL %s: %s", url, e)
+                        logger.error(traceback.format_exc())
+                        reason = get_download_failure_reason(e, platform)
+                        await safe_edit_status(status_msg, f"Failed: {reason}")
+                        await chat.send_message(
+                            build_download_error_message(url, reason),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+    finally:
+        await release_url(url)
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -393,66 +527,62 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     async with download_semaphore:
-        temp_dir_obj = tempfile.TemporaryDirectory(prefix="video-bot-")
-        temp_dir = Path(temp_dir_obj.name)
-        try:
-            logger.info("Inline download started: user_id=%s url=%s", user_id, url)
-            file_path = await download_video(url, platform, temp_dir)
-            if not file_path.exists():
-                raise FileNotFoundError("Downloaded file not found.")
+        async with global_download_slot():
+            with tempfile.TemporaryDirectory(prefix="video-bot-") as temp_dir_name:
+                temp_dir = Path(temp_dir_name)
+                try:
+                    logger.info("Inline download started: user_id=%s url=%s", user_id, url)
+                    file_path = await download_video(url, platform, temp_dir)
+                    if not file_path.exists():
+                        raise FileNotFoundError("Downloaded file not found.")
 
-            file_size = file_path.stat().st_size
-            logger.info(
-                "Inline download finished: user_id=%s url=%s size_bytes=%s",
-                user_id,
-                url,
-                file_size,
-            )
-            if file_size > MAX_BOT_FILE_BYTES:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="Video is too large for Telegram. Download it from the original link.",
-                )
-                await inline_query.answer(results=[], cache_time=1, is_personal=True)
-                return
+                    file_size = file_path.stat().st_size
+                    logger.info(
+                        "Inline download finished: user_id=%s url=%s size_bytes=%s",
+                        user_id,
+                        url,
+                        file_size,
+                    )
+                    if file_size > MAX_BOT_FILE_BYTES:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text="Video is too large for Telegram. Download it from the original link.",
+                        )
+                        await inline_query.answer(results=[], cache_time=1, is_personal=True)
+                        return
 
-            with file_path.open("rb") as f:
-                sent = await context.bot.send_video(
-                    chat_id=user_id,
-                    video=f,
-                    supports_streaming=True,
-                    caption=video_caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            file_id = sent.video.file_id if sent and sent.video else None
-            if not file_id:
-                raise RuntimeError("Failed to get file_id for inline result.")
+                    with file_path.open("rb") as f:
+                        sent = await context.bot.send_video(
+                            chat_id=user_id,
+                            video=f,
+                            supports_streaming=True,
+                            caption=video_caption,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    file_id = sent.video.file_id if sent and sent.video else None
+                    if not file_id:
+                        raise RuntimeError("Failed to get file_id for inline result.")
 
-            inline_cache[url] = file_id
-            results = [
-                InlineQueryResultCachedVideo(
-                    id=f"cached-{abs(hash(url))}",
-                    video_file_id=file_id,
-                    title="Video",
-                )
-            ]
-            await inline_query.answer(results=results, cache_time=60, is_personal=True)
-        except Exception as e:
-            logger.error("Error handling inline URL %s: %s", url, e)
-            logger.error(traceback.format_exc())
-            await inline_query.answer(results=[], cache_time=1, is_personal=True)
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="Error while downloading video. Try again later.",
-                )
-            except Exception:
-                logger.error("Failed to notify user in private chat: user_id=%s", user_id)
-        finally:
-            try:
-                temp_dir_obj.cleanup()
-            except Exception:
-                logger.error("Failed to clean temp dir: %s", temp_dir)
+                    inline_cache[url] = file_id
+                    results = [
+                        InlineQueryResultCachedVideo(
+                            id=f"cached-{abs(hash(url))}",
+                            video_file_id=file_id,
+                            title="Video",
+                        )
+                    ]
+                    await inline_query.answer(results=results, cache_time=60, is_personal=True)
+                except Exception as e:
+                    logger.error("Error handling inline URL %s: %s", url, e)
+                    logger.error(traceback.format_exc())
+                    await inline_query.answer(results=[], cache_time=1, is_personal=True)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text="Error while downloading video. Try again later.",
+                        )
+                    except Exception:
+                        logger.error("Failed to notify user in private chat: user_id=%s", user_id)
 
 
 async def log_heartbeat(_: ContextTypes.DEFAULT_TYPE) -> None:
