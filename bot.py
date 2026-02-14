@@ -6,6 +6,7 @@ Usage (local):
 
 import asyncio
 import contextlib
+import dataclasses
 import html
 import logging
 import os
@@ -14,11 +15,12 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+import requests
 import yt_dlp
-from telegram import InlineQueryResultCachedVideo, Update
+from telegram import InlineQueryResultCachedVideo, InputMediaPhoto, InputMediaVideo, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, InlineQueryHandler, MessageHandler, filters
 
@@ -61,6 +63,24 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # URL Detection
 # -------------------------
 URL_REGEX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
+
+
+@dataclasses.dataclass
+class MediaItem:
+    type: str
+    meta: dict
+    preferred_ext: str
+    estimated_filesize: int | None
+    index: int = 1
+
+
+class MediaDownloadError(RuntimeError):
+    pass
+
+
+class LoginRequiredError(MediaDownloadError):
+    pass
 
 
 def extract_links(text: str) -> list[str]:
@@ -180,13 +200,24 @@ async def find_download_target(text: str) -> tuple[str | None, str | None]:
 # -------------------------
 # Downloader
 # -------------------------
-async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
-    """Run yt-dlp in a thread and return downloaded file path."""
+def _normalize_url_for_extraction(url: str, platform: str) -> list[str]:
+    parsed = urlparse(url)
+    candidates: list[str] = []
+    if platform == "instagram":
+        clean_query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "img_index"]
+        cleaned = parsed._replace(query=urlencode(clean_query))
+        candidates.append(urlunparse(cleaned))
+    elif platform == "tiktok" and "/photo/" in parsed.path:
+        candidates.append(urlunparse(parsed._replace(path=parsed.path.replace("/photo/", "/video/", 1))))
+        candidates.append(url)
+    else:
+        candidates.append(url)
+    return list(dict.fromkeys(candidates))
+
+
+def _base_ydl_opts(platform: str, temp_dir: Path | None = None, prefer_photo: bool = False) -> dict:
     ydl_opts = {
-        "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "noplaylist": True,
-        "merge_output_format": "mp4",
+        "noplaylist": False,
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 2,
@@ -198,9 +229,15 @@ async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
         },
         "quiet": True,
         "no_warnings": True,
-        "max_filesize": MAX_BOT_FILE_BYTES,
     }
-
+    if temp_dir is not None:
+        ydl_opts["outtmpl"] = str(temp_dir / "%(id)s.%(ext)s")
+    if prefer_photo:
+        ydl_opts["format"] = "best"
+    else:
+        ydl_opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["max_filesize"] = MAX_BOT_FILE_BYTES
     if platform == "redgifs":
         ydl_opts["format"] = "best[ext=mp4]/best"
         ydl_opts["sleep_interval_requests"] = 10
@@ -210,90 +247,259 @@ async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
         }
 
     default_cookiefile = get_cookiefile_for_platform(platform)
-    if default_cookiefile and default_cookiefile.exists() and platform != "redgifs":
+    if default_cookiefile and default_cookiefile.exists():
         ydl_opts["cookiefile"] = str(default_cookiefile)
     elif default_cookiefile:
         logger.warning("Cookies file is missing for %s: %s", platform, default_cookiefile)
+    return ydl_opts
 
-    def _run() -> str:
+
+def _infer_media_type(meta: dict) -> str:
+    ext = (meta.get("ext") or "").lower()
+    url = (meta.get("url") or "").lower()
+    if meta.get("vcodec") and meta.get("vcodec") != "none":
+        return "video"
+    if meta.get("duration") not in (None, 0):
+        return "video"
+    if ext in IMAGE_EXTENSIONS or any(url.endswith(f".{image_ext}") for image_ext in IMAGE_EXTENSIONS):
+        return "photo"
+    if meta.get("thumbnails") and not meta.get("formats"):
+        return "photo"
+    return "video"
+
+
+def _build_media_item(meta: dict | str, index: int) -> MediaItem:
+    if not isinstance(meta, dict):
+        meta = {"url": str(meta), "id": f"item_{index}"}
+    media_type = _infer_media_type(meta)
+    preferred_ext = (meta.get("ext") or ("jpg" if media_type == "photo" else "mp4")).lower()
+    estimated_filesize = meta.get("filesize") or meta.get("filesize_approx")
+    return MediaItem(
+        type=media_type,
+        meta=meta,
+        preferred_ext=preferred_ext,
+        estimated_filesize=estimated_filesize,
+        index=index,
+    )
+
+
+async def extract_media_items(url: str, platform: str) -> list[MediaItem]:
+    ydl_opts = _base_ydl_opts(platform, temp_dir=None, prefer_photo=True)
+    ydl_opts["skip_download"] = True
+
+    def _run_extract(target_url: str) -> dict:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            return ydl.prepare_filename(info)
+            return ydl.extract_info(target_url, download=False)
 
-    last_error = None
-    for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+    candidates = _normalize_url_for_extraction(url, platform)
+    last_error: Exception | None = None
+    info: dict | None = None
+    for candidate in candidates:
         try:
-            filename = await asyncio.to_thread(_run)
-            return Path(filename)
+            info = await asyncio.to_thread(_run_extract, candidate)
+            break
+        except yt_dlp.utils.UnsupportedError as err:
+            last_error = err
         except Exception as err:
             last_error = err
-            error_text = str(err).lower()
-            logger.exception(
-                "yt-dlp attempt failed: attempt=%s/%s platform=%s url=%s cookiefile=%s",
-                attempt,
-                DOWNLOAD_RETRY_ATTEMPTS,
-                platform,
-                url,
-                ydl_opts.get("cookiefile", "none"),
-            )
+            if candidate != candidates[-1]:
+                logger.warning("extract_info failed, trying next candidate: url=%s err=%s", candidate, err)
 
-            if "redirect" in error_text:
-                logger.warning("Redirect-related yt-dlp error. final_url=%s error=%s", url, err)
+    if info is None:
+        raise MediaDownloadError(f"Failed to extract media info: {url}") from last_error
 
-            if platform == "redgifs" and default_cookiefile and "cookiefile" not in ydl_opts:
-                if default_cookiefile.exists():
-                    ydl_opts["cookiefile"] = str(default_cookiefile)
-                    logger.warning(
-                        "Retrying redgifs download with cookies: cookies=%s",
-                        default_cookiefile,
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if entries:
+        items = [_build_media_item(entry, idx + 1) for idx, entry in enumerate(entries) if entry]
+    else:
+        items = [_build_media_item(info, 1)]
+
+    if not items:
+        raise MediaDownloadError("No media entries found in extracted info")
+    return items
+
+
+def _pick_downloaded_file(temp_dir: Path, result_info: dict, ydl: yt_dlp.YoutubeDL) -> Path | None:
+    requested_downloads = result_info.get("requested_downloads") or []
+    for download_info in requested_downloads:
+        filepath = download_info.get("filepath")
+        if filepath and Path(filepath).exists():
+            return Path(filepath)
+    filename = result_info.get("_filename")
+    if filename and Path(filename).exists():
+        return Path(filename)
+    prepared = ydl.prepare_filename(result_info)
+    if prepared and Path(prepared).exists():
+        return Path(prepared)
+    files = sorted(temp_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+def _resolve_image_url(meta: dict) -> str | None:
+    candidates = [
+        meta.get("url"),
+        meta.get("thumbnail"),
+        meta.get("display_url"),
+    ]
+    thumbnails = meta.get("thumbnails") or []
+    if thumbnails and isinstance(thumbnails, list):
+        first_thumb = thumbnails[0] or {}
+        if isinstance(first_thumb, dict):
+            candidates.append(first_thumb.get("url"))
+    formats = meta.get("formats") or []
+    if formats and isinstance(formats, list):
+        first_format = formats[0] or {}
+        if isinstance(first_format, dict):
+            candidates.append(first_format.get("url"))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        clean = str(candidate).replace("\\u0026", "&")
+        clean = html.unescape(clean)
+        if clean.startswith("http://") or clean.startswith("https://"):
+            return clean
+    return None
+
+
+def _http_extension_from_response(url: str, content_type: str | None, preferred_ext: str) -> str:
+    if content_type:
+        lowered = content_type.lower()
+        if "jpeg" in lowered:
+            return "jpg"
+        if "png" in lowered:
+            return "png"
+        if "webp" in lowered:
+            return "webp"
+        if "gif" in lowered:
+            return "gif"
+    suffix = Path(urlparse(url).path).suffix.lower().lstrip(".")
+    if suffix in IMAGE_EXTENSIONS:
+        return suffix
+    return preferred_ext if preferred_ext in IMAGE_EXTENSIONS else "jpg"
+
+
+async def _direct_http_download_photo(item: MediaItem, temp_dir: Path) -> Path:
+    img_url = _resolve_image_url(item.meta)
+    if not img_url:
+        raise MediaDownloadError("Photo URL not found in media metadata")
+
+    def _run_http() -> Path:
+        headers = {"User-Agent": CHROME_USER_AGENT}
+        last_err: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                with requests.get(img_url, headers=headers, timeout=20, stream=True) as response:
+                    status_code = response.status_code
+                    if status_code in (401, 403):
+                        raise LoginRequiredError("login required")
+                    response.raise_for_status()
+                    ext = _http_extension_from_response(
+                        img_url, response.headers.get("Content-Type"), item.preferred_ext
                     )
-                    continue
-                logger.warning(
-                    "Redgifs retry with cookies skipped, file is missing: %s",
-                    default_cookiefile,
-                )
+                    filename = f"{item.meta.get('id') or f'photo_{int(time.time() * 1000)}'}.{ext}"
+                    destination = temp_dir / filename
+                    with destination.open("wb") as output:
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            output.write(chunk)
+                            if output.tell() > MAX_BOT_FILE_BYTES:
+                                raise MediaDownloadError("media is too large for Telegram")
+                    return destination
+            except Exception as err:
+                last_err = err
+                if attempt >= 3:
+                    break
+                time.sleep(RETRY_PAUSE_SECONDS)
+        raise MediaDownloadError(f"Direct photo download failed: {img_url}") from last_err
 
-            login_required = any(
-                phrase in error_text
-                for phrase in (
-                    "login required",
-                    "sign in",
-                    "age-restricted",
-                    "age restricted",
-                    "confirm you're not a bot",
-                    "confirm you are not a bot",
-                )
-            )
-            if login_required and default_cookiefile and "cookiefile" not in ydl_opts:
-                if default_cookiefile.exists():
-                    ydl_opts["cookiefile"] = str(default_cookiefile)
-                    logger.warning(
-                        "Retrying with cookies after login-required error: platform=%s cookies=%s",
-                        platform,
-                        default_cookiefile,
+    return await asyncio.to_thread(_run_http)
+
+
+async def download_media_item(item: MediaItem, temp_dir: Path, platform: str) -> Path:
+    async def _download_with_ytdlp(prefer_photo: bool) -> Path:
+        ydl_opts = _base_ydl_opts(platform, temp_dir=temp_dir, prefer_photo=prefer_photo)
+
+        def _run() -> Path:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    result_info = ydl.process_ie_result(item.meta, download=True)
+                except Exception:
+                    source_url = (
+                        item.meta.get("webpage_url")
+                        or item.meta.get("original_url")
+                        or item.meta.get("url")
                     )
-                    continue
-                logger.warning(
-                    "Login-required error but cookies are missing: platform=%s expected=%s",
-                    platform,
-                    default_cookiefile,
-                )
+                    if not source_url:
+                        raise
+                    result_info = ydl.extract_info(source_url, download=True)
+                if isinstance(result_info, list):
+                    result_info = result_info[0] if result_info else {}
+                if not isinstance(result_info, dict):
+                    raise MediaDownloadError("yt-dlp returned unexpected result")
+                file_path = _pick_downloaded_file(temp_dir, result_info, ydl)
+                if not file_path or not file_path.exists():
+                    raise FileNotFoundError("Downloaded file not found after yt-dlp run")
+                return file_path
 
-            if attempt >= DOWNLOAD_RETRY_ATTEMPTS:
-                break
-            logger.warning(
-                "Download attempt failed (attempt=%s/%s, platform=%s, url=%s): %s",
-                attempt,
-                DOWNLOAD_RETRY_ATTEMPTS,
-                platform,
-                url,
-                err,
-            )
-            await asyncio.sleep(RETRY_PAUSE_SECONDS)
+        return await asyncio.to_thread(_run)
 
-    raise RuntimeError(f"Failed to download after retries: {url}") from last_error
+    if item.estimated_filesize and item.estimated_filesize > MAX_BOT_FILE_BYTES:
+        raise MediaDownloadError("media is too large for Telegram")
+
+    if item.type == "video":
+        file_path = await _download_with_ytdlp(prefer_photo=False)
+        item.meta["_download_method"] = "yt-dlp"
+        return file_path
+
+    try:
+        file_path = await _download_with_ytdlp(prefer_photo=True)
+        item.meta["_download_method"] = "yt-dlp"
+        return file_path
+    except Exception as err:
+        error_text = str(err).lower()
+        if "no video formats" in error_text:
+            logger.warning("No video formats; trigger photo-fallback")
+        if not any(
+            phrase in error_text
+            for phrase in ("unsupported", "no video formats", "requested format is not available")
+        ):
+            raise
+    file_path = await _direct_http_download_photo(item, temp_dir)
+    item.meta["_download_method"] = "direct-http"
+    return file_path
+
+
+async def download_media_items(url: str, platform: str, temp_dir: Path) -> list[tuple[Path, str]]:
+    items = await extract_media_items(url, platform)
+    downloaded: list[tuple[Path, str]] = []
+    for idx, item in enumerate(items, start=1):
+        file_path = await download_media_item(item, temp_dir, platform)
+        if not file_path.exists():
+            raise FileNotFoundError("Downloaded file not found.")
+        size_bytes = file_path.stat().st_size
+        if size_bytes > MAX_BOT_FILE_BYTES:
+            raise MediaDownloadError("media is too large for Telegram")
+        method = item.meta.get("_download_method", "yt-dlp")
+        logger.info(
+            "Media item downloaded: download_method=%s size_bytes=%s index_in_carousel=%s",
+            method,
+            size_bytes,
+            idx,
+        )
+        downloaded.append((file_path, item.type))
+    return downloaded
+
+
+async def download_video(url: str, platform: str, temp_dir: Path) -> Path:
+    media_files = await download_media_items(url, platform, temp_dir)
+    if len(media_files) == 1 and media_files[0][1] == "video":
+        return media_files[0][0]
+    first_video = next((path for path, media_type in media_files if media_type == "video"), None)
+    if first_video:
+        return first_video
+    raise MediaDownloadError("No single video file available")
 
 
 # -------------------------
@@ -371,7 +577,7 @@ def resolve_sender_name(user) -> str:
 def build_video_caption(source_url: str, sender_name: str, multiple_links: bool = False) -> str:
     safe_url = html.escape(source_url, quote=True)
     safe_sender_name = html.escape(sender_name)
-    caption = f'<a href="{safe_url}">Video</a> sent by <b>{safe_sender_name}</b>'
+    caption = f'<a href="{safe_url}">Post</a> sent by <b>{safe_sender_name}</b>'
     if multiple_links:
         caption += "\n\nOnly one link per message is supported."
     return caption
@@ -413,9 +619,11 @@ def get_download_failure_reason(err: Exception, platform: str) -> str:
     if "downloaded file not found" in error_text:
         return "download failed: file not found after yt-dlp run"
     if "max-filesize" in error_text or "larger than max" in error_text:
-        return "video is too large for Telegram"
+        return "media is too large for Telegram"
     if "too large for telegram" in error_text:
-        return "video is too large for Telegram"
+        return "media is too large for Telegram"
+    if "no media entries found" in error_text:
+        return "no downloadable media found"
 
     return _normalize_error_reason(error_chain[-1] or error_chain[0])
 
@@ -423,7 +631,7 @@ def get_download_failure_reason(err: Exception, platform: str) -> str:
 def build_download_error_message(source_url: str, reason: str) -> str:
     safe_url = html.escape(source_url, quote=True)
     safe_reason = html.escape(_normalize_error_reason(reason))
-    return f'Couldn\'t download <a href="{safe_url}">video</a>: <i>{safe_reason}</i>'
+    return f'Couldn\'t download <a href="{safe_url}">media</a>: <i>{safe_reason}</i>'
 
 
 async def find_download_target_from_first_link(text: str) -> tuple[str | None, str | None, bool]:
@@ -493,37 +701,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     temp_dir = Path(temp_dir_name)
 
                     try:
-                        file_path = await download_video(url, platform, temp_dir)
-                        if not file_path.exists():
-                            raise FileNotFoundError("Downloaded file not found.")
+                        media_files = await download_media_items(url, platform, temp_dir)
+                        if not media_files:
+                            raise MediaDownloadError("No downloadable media found")
 
-                        file_size = file_path.stat().st_size
-                        logger.info("Download finished: chat_id=%s url=%s size_bytes=%s", chat.id, url, file_size)
-
-                        if file_size <= MAX_BOT_FILE_BYTES:
-                            # 3) success: send video and remove status message
-                            logger.info("Sending video: chat_id=%s url=%s", chat.id, url)
+                        if len(media_files) == 1:
+                            file_path, media_type = media_files[0]
+                            logger.info("Sending single media: chat_id=%s url=%s type=%s", chat.id, url, media_type)
                             with file_path.open("rb") as f:
-                                await chat.send_video(
-                                    video=f,
-                                    supports_streaming=True,
-                                    caption=video_caption,
-                                    parse_mode=ParseMode.HTML,
-                                )
-                            try:
-                                await status_msg.delete()
-                                status_msg = None
-                            except Exception as delete_err:
-                                logger.info("Could not delete status message: %s", delete_err)
+                                if media_type == "photo":
+                                    await chat.send_photo(photo=f, caption=video_caption, parse_mode=ParseMode.HTML)
+                                else:
+                                    await chat.send_video(
+                                        video=f,
+                                        supports_streaming=True,
+                                        caption=video_caption,
+                                        parse_mode=ParseMode.HTML,
+                                    )
                         else:
-                            # 4) explicit failure with short status and chat error details
-                            reason = "video is too large for Telegram"
-                            await safe_edit_status(status_msg, f"Failed: {reason}")
-                            await chat.send_message(
-                                build_download_error_message(url, reason),
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True,
+                            logger.info(
+                                "Sending media group: chat_id=%s url=%s count=%s",
+                                chat.id,
+                                url,
+                                len(media_files),
                             )
+                            for chunk_start in range(0, len(media_files), 10):
+                                chunk = media_files[chunk_start : chunk_start + 10]
+                                opened_files = [file_path.open("rb") for file_path, _ in chunk]
+                                try:
+                                    media_group = []
+                                    for idx, ((_, media_type), opened_file) in enumerate(zip(chunk, opened_files)):
+                                        caption = video_caption if chunk_start == 0 and idx == 0 else None
+                                        parse_mode = ParseMode.HTML if caption else None
+                                        if media_type == "photo":
+                                            media_group.append(
+                                                InputMediaPhoto(media=opened_file, caption=caption, parse_mode=parse_mode)
+                                            )
+                                        else:
+                                            media_group.append(
+                                                InputMediaVideo(
+                                                    media=opened_file,
+                                                    caption=caption,
+                                                    parse_mode=parse_mode,
+                                                    supports_streaming=True,
+                                                )
+                                            )
+                                    await chat.send_media_group(media=media_group)
+                                finally:
+                                    for opened_file in opened_files:
+                                        opened_file.close()
+
+                        try:
+                            await status_msg.delete()
+                            status_msg = None
+                        except Exception as delete_err:
+                            logger.info("Could not delete status message: %s", delete_err)
                     except Exception as e:
                         logger.error("Error handling URL %s: %s", url, e)
                         logger.error(traceback.format_exc())
@@ -576,46 +808,80 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 temp_dir = Path(temp_dir_name)
                 try:
                     logger.info("Inline download started: user_id=%s url=%s", user_id, url)
-                    file_path = await download_video(url, platform, temp_dir)
-                    if not file_path.exists():
-                        raise FileNotFoundError("Downloaded file not found.")
+                    media_files = await download_media_items(url, platform, temp_dir)
+                    if not media_files:
+                        raise MediaDownloadError("No downloadable media found")
 
-                    file_size = file_path.stat().st_size
-                    logger.info(
-                        "Inline download finished: user_id=%s url=%s size_bytes=%s",
-                        user_id,
-                        url,
-                        file_size,
-                    )
-                    if file_size > MAX_BOT_FILE_BYTES:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text="Video is too large for Telegram. Download it from the original link.",
-                        )
-                        await inline_query.answer(results=[], cache_time=1, is_personal=True)
+                    if len(media_files) == 1 and media_files[0][1] == "video":
+                        file_path, _ = media_files[0]
+                        with file_path.open("rb") as f:
+                            sent = await context.bot.send_video(
+                                chat_id=user_id,
+                                video=f,
+                                supports_streaming=True,
+                                caption=video_caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        file_id = sent.video.file_id if sent and sent.video else None
+                        if not file_id:
+                            raise RuntimeError("Failed to get file_id for inline result.")
+                        inline_cache[url] = file_id
+                        results = [
+                            InlineQueryResultCachedVideo(
+                                id=f"cached-{abs(hash(url))}",
+                                video_file_id=file_id,
+                                title="Video",
+                            )
+                        ]
+                        await inline_query.answer(results=results, cache_time=60, is_personal=True)
                         return
 
-                    with file_path.open("rb") as f:
-                        sent = await context.bot.send_video(
-                            chat_id=user_id,
-                            video=f,
-                            supports_streaming=True,
-                            caption=video_caption,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    file_id = sent.video.file_id if sent and sent.video else None
-                    if not file_id:
-                        raise RuntimeError("Failed to get file_id for inline result.")
+                    if len(media_files) == 1:
+                        file_path, media_type = media_files[0]
+                        with file_path.open("rb") as f:
+                            if media_type == "photo":
+                                await context.bot.send_photo(
+                                    chat_id=user_id,
+                                    photo=f,
+                                    caption=video_caption,
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            else:
+                                await context.bot.send_video(
+                                    chat_id=user_id,
+                                    video=f,
+                                    supports_streaming=True,
+                                    caption=video_caption,
+                                    parse_mode=ParseMode.HTML,
+                                )
+                    else:
+                        for chunk_start in range(0, len(media_files), 10):
+                            chunk = media_files[chunk_start : chunk_start + 10]
+                            opened_files = [file_path.open("rb") for file_path, _ in chunk]
+                            try:
+                                media_group = []
+                                for idx, ((_, media_type), opened_file) in enumerate(zip(chunk, opened_files)):
+                                    caption = video_caption if chunk_start == 0 and idx == 0 else None
+                                    parse_mode = ParseMode.HTML if caption else None
+                                    if media_type == "photo":
+                                        media_group.append(
+                                            InputMediaPhoto(media=opened_file, caption=caption, parse_mode=parse_mode)
+                                        )
+                                    else:
+                                        media_group.append(
+                                            InputMediaVideo(
+                                                media=opened_file,
+                                                caption=caption,
+                                                parse_mode=parse_mode,
+                                                supports_streaming=True,
+                                            )
+                                        )
+                                await context.bot.send_media_group(chat_id=user_id, media=media_group)
+                            finally:
+                                for opened_file in opened_files:
+                                    opened_file.close()
 
-                    inline_cache[url] = file_id
-                    results = [
-                        InlineQueryResultCachedVideo(
-                            id=f"cached-{abs(hash(url))}",
-                            video_file_id=file_id,
-                            title="Video",
-                        )
-                    ]
-                    await inline_query.answer(results=results, cache_time=60, is_personal=True)
+                    await inline_query.answer(results=[], cache_time=1, is_personal=True)
                 except Exception as e:
                     logger.error("Error handling inline URL %s: %s", url, e)
                     logger.error(traceback.format_exc())
@@ -623,7 +889,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                     try:
                         await context.bot.send_message(
                             chat_id=user_id,
-                            text="Error while downloading video. Try again later.",
+                            text="Error while downloading media. Try again later.",
                         )
                     except Exception:
                         logger.error("Failed to notify user in private chat: user_id=%s", user_id)
